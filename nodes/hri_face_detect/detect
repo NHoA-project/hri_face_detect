@@ -2,9 +2,9 @@
 
 import tf
 from hri_msgs.msg import IdsList, FacialLandmarks, NormalizedPointOfInterest2D
-from sensor_msgs.msg import Image, CameraInfo, RegionOfInterest
+from sensor_msgs.msg import Image, CameraInfo, RegionOfInterest, CompressedImage
 from geometry_msgs.msg import Transform, TransformStamped, Vector3, Quaternion
-from std_msgs.msg import Empty, Header
+from std_msgs.msg import Empty, Header, Float32
 import tf_conversions.posemath as pm
 from cv_bridge import CvBridge
 import rospy
@@ -17,6 +17,7 @@ from tf.transformations import quaternion_from_euler
 from hri_face_detect.face_pose_estimation import face_pose_estimation
 
 import mediapipe as mp
+from hri_face_detect.face_detection import extract_face_2, detect_smile
 
 mp_face_detection = mp.solutions.face_detection
 mp_face_mesh = mp.solutions.face_mesh
@@ -179,6 +180,11 @@ class Face:
 
         # True once the publishers are initialised
         self.ready = False
+        
+        # Custom
+        self.crop_face = None
+        self.crop_align = None
+        self.smile_pub = None
 
     def initialise_publishers(self):
         """Initialises all the publishers for this face.
@@ -199,14 +205,20 @@ class Face:
         )
 
         self.cropped_pub = rospy.Publisher(
-            "/humans/faces/%s/cropped" % self.id,
-            Image,
+            "/humans/faces/%s/cropped/compressed" % self.id,
+            CompressedImage,
             queue_size=1,
         )
 
         self.aligned_pub = rospy.Publisher(
-            "/humans/faces/%s/aligned" % self.id,
-            Image,
+            "/humans/faces/%s/aligned/compressed" % self.id,
+            CompressedImage,
+            queue_size=1,
+        )
+        
+        self.smile_pub = rospy.Publisher(
+            "/humans/faces/%s/smile_score" % self.id,
+            Float32,
             queue_size=1,
         )
 
@@ -240,34 +252,46 @@ class Face:
 
         self.publish_cropped_face(src_image)
         self.publish_aligned_face(src_image)
+        
 
     def publish_cropped_face(self, src_image):
+        msg = CompressedImage()
+        msg.header.stamp = rospy.Time.now()
+        msg.format = "jpeg"
+        if type(self.crop_face) is not np.ndarray:
+            # no-one interested in the face image? skip it!
+            if self.cropped_pub.get_num_connections() == 0:
+                return
 
-        # no-one interested in the face image? skip it!
-        if self.cropped_pub.get_num_connections() == 0:
-            return
+            roi = src_image[
+                self.bb.y_offset : self.bb.y_offset + self.bb.height,
+                self.bb.x_offset : self.bb.x_offset + self.bb.width,
+            ]
 
-        roi = src_image[
-            self.bb.y_offset : self.bb.y_offset + self.bb.height,
-            self.bb.x_offset : self.bb.x_offset + self.bb.width,
-        ]
+            sx = cropped_face_width * 1.0 / self.bb.width
+            sy = cropped_face_height * 1.0 / self.bb.height
 
-        sx = cropped_face_width * 1.0 / self.bb.width
-        sy = cropped_face_height * 1.0 / self.bb.height
+            scale = min(sx, sy)
 
-        scale = min(sx, sy)
+            scaled = cv2.resize(roi, None, fx=scale, fy=scale)
+            scaled_h, scaled_w = scaled.shape[:2]
 
-        scaled = cv2.resize(roi, None, fx=scale, fy=scale)
-        scaled_h, scaled_w = scaled.shape[:2]
+            output = np.zeros((cropped_face_width, cropped_face_height, 3), np.uint8)
 
-        output = np.zeros((cropped_face_width, cropped_face_height, 3), np.uint8)
+            x_offset = int((cropped_face_width - scaled_w) / 2)
+            y_offset = int((cropped_face_height - scaled_h) / 2)
 
-        x_offset = int((cropped_face_width - scaled_w) / 2)
-        y_offset = int((cropped_face_height - scaled_h) / 2)
+            output[y_offset : y_offset + scaled_h, x_offset : x_offset + scaled_w] = scaled
 
-        output[y_offset : y_offset + scaled_h, x_offset : x_offset + scaled_w] = scaled
-
-        self.cropped_pub.publish(CvBridge().cv2_to_imgmsg(output, encoding="bgr8"))
+            
+            msg.data = np.array(cv2.imencode('.jpg', output)[1]).tostring()
+            #self.cropped_pub.publish(CvBridge().cv2_to_imgmsg(output, encoding="bgr8"))
+            self.cropped_pub.publish(msg)
+        
+        else:
+            msg.data = np.array(cv2.imencode('.jpg', self.crop_face)[1]).tostring()
+            #self.cropped_pub.publish(CvBridge().cv2_to_imgmsg(self.crop_face, encoding="bgr8"))
+            self.cropped_pub.publish(msg)
 
     def publish_aligned_face(self, src_image):
         """Aligns given face in img based on left and right eye coordinates.
@@ -276,72 +300,84 @@ class Face:
         Author: serengil
         Original source: https://github.com/serengil/deepface/blob/f07f278/deepface/detectors/FaceDetector.py#L68
         """
+        
+        msg = CompressedImage()
+        msg.header.stamp = rospy.Time.now()
+        msg.format = "jpeg"
+        
+        if type(self.crop_align) is not np.ndarray:
+            # no-one interested in the face image? skip it!
+            if self.aligned_pub.get_num_connections() == 0:
+                return
 
-        # no-one interested in the face image? skip it!
-        if self.aligned_pub.get_num_connections() == 0:
-            return
+            img_height, img_width, _ = src_image.shape
+            x, y, w, h = self.bb.x_offset, self.bb.y_offset, self.bb.width, self.bb.height
 
-        img_height, img_width, _ = src_image.shape
-        x, y, w, h = self.bb.x_offset, self.bb.y_offset, self.bb.width, self.bb.height
+            # expand the ROI a little to ensure the rotation does not introduce black zones
+            xm1 = max(0, x - w // 2)
+            xm2 = min(x + w + w // 2, img_width)
+            ym1 = max(0, y - h // 2)
+            ym2 = min(y + h + h // 2, img_height)
+            preroi = src_image[ym1:ym2, xm1:xm2]
 
-        # expand the ROI a little to ensure the rotation does not introduce black zones
-        xm1 = max(0, x - w // 2)
-        xm2 = min(x + w + w // 2, img_width)
-        ym1 = max(0, y - h // 2)
-        ym2 = min(y + h + h // 2, img_height)
-        preroi = src_image[ym1:ym2, xm1:xm2]
+            left_eye_x, left_eye_y = self.left_eye
+            right_eye_x, right_eye_y = self.right_eye
 
-        left_eye_x, left_eye_y = self.left_eye
-        right_eye_x, right_eye_y = self.right_eye
+            # -----------------------
+            # find rotation direction
 
-        # -----------------------
-        # find rotation direction
+            if left_eye_y > right_eye_y:
+                point_3rd = (right_eye_x, left_eye_y)
+                direction = -1  # rotate same direction to clock
+            else:
+                point_3rd = (left_eye_x, right_eye_y)
+                direction = 1  # rotate inverse direction of clock
 
-        if left_eye_y > right_eye_y:
-            point_3rd = (right_eye_x, left_eye_y)
-            direction = -1  # rotate same direction to clock
+            # find length of triangle edges
+            a = math.dist(self.left_eye, point_3rd)
+            b = math.dist(self.right_eye, point_3rd)
+            c = math.dist(self.right_eye, self.left_eye)
+
+            # apply cosine rule
+            if b != 0 and c != 0:
+
+                cos_a = (b * b + c * c - a * a) / (2 * b * c)
+                angle = np.arccos(cos_a)  # angle in radian
+                angle = (angle * 180) / math.pi  # radian to degree
+
+                # rotate base image
+
+                if direction == -1:
+                    angle = 90 - angle
+
+                img = PILImage.fromarray(preroi)  # convert to a PIL image to rotate it
+                preroi = np.array(img.rotate(-direction * angle, PILImage.BILINEAR))
+
+            roi = preroi[y - ym1 : y - ym1 + h, x - xm1 : x - xm1 + w]
+
+            sx = cropped_face_width * 1.0 / self.bb.width
+            sy = cropped_face_height * 1.0 / self.bb.height
+
+            scale = min(sx, sy)
+
+            scaled = cv2.resize(roi, None, fx=scale, fy=scale)
+            scaled_h, scaled_w = scaled.shape[:2]
+
+            output = np.zeros((cropped_face_width, cropped_face_height, 3), np.uint8)
+
+            x_offset = int((cropped_face_width - scaled_w) / 2)
+            y_offset = int((cropped_face_height - scaled_h) / 2)
+
+            output[y_offset : y_offset + scaled_h, x_offset : x_offset + scaled_w] = scaled
+
+            #self.aligned_pub.publish(CvBridge().cv2_to_imgmsg(output, encoding="bgr8"))
+            msg.data = np.array(cv2.imencode('.jpg', output)[1]).tostring()
+            self.aligned_pub.publish(msg)
+        
         else:
-            point_3rd = (left_eye_x, right_eye_y)
-            direction = 1  # rotate inverse direction of clock
-
-        # find length of triangle edges
-        a = math.dist(self.left_eye, point_3rd)
-        b = math.dist(self.right_eye, point_3rd)
-        c = math.dist(self.right_eye, self.left_eye)
-
-        # apply cosine rule
-        if b != 0 and c != 0:
-
-            cos_a = (b * b + c * c - a * a) / (2 * b * c)
-            angle = np.arccos(cos_a)  # angle in radian
-            angle = (angle * 180) / math.pi  # radian to degree
-
-            # rotate base image
-
-            if direction == -1:
-                angle = 90 - angle
-
-            img = PILImage.fromarray(preroi)  # convert to a PIL image to rotate it
-            preroi = np.array(img.rotate(-direction * angle, PILImage.BILINEAR))
-
-        roi = preroi[y - ym1 : y - ym1 + h, x - xm1 : x - xm1 + w]
-
-        sx = cropped_face_width * 1.0 / self.bb.width
-        sy = cropped_face_height * 1.0 / self.bb.height
-
-        scale = min(sx, sy)
-
-        scaled = cv2.resize(roi, None, fx=scale, fy=scale)
-        scaled_h, scaled_w = scaled.shape[:2]
-
-        output = np.zeros((cropped_face_width, cropped_face_height, 3), np.uint8)
-
-        x_offset = int((cropped_face_width - scaled_w) / 2)
-        y_offset = int((cropped_face_height - scaled_h) / 2)
-
-        output[y_offset : y_offset + scaled_h, x_offset : x_offset + scaled_w] = scaled
-
-        self.aligned_pub.publish(CvBridge().cv2_to_imgmsg(output, encoding="bgr8"))
+            #self.aligned_pub.publish(CvBridge().cv2_to_imgmsg(self.crop_align, encoding="bgr8"))
+            msg.data = np.array(cv2.imencode('.jpg', self.crop_align)[1]).tostring()
+            self.aligned_pub.publish(msg)
 
     def compute_6d_pose(self, K, image, camera_optical_frame):
 
@@ -444,8 +480,8 @@ class Face:
 
 
 class FaceDetector:
-    def __init__(self, face_mesh=True, max_num_faces=10):
-
+    def __init__(self, face_mesh=False, max_num_faces=10):
+        
         self.face_mesh = face_mesh
 
         if not face_mesh:
@@ -483,19 +519,36 @@ class FaceDetector:
 
     def detect(self, img, img_width, img_height):
         """img is expected as RGB"""
+        rospy.loginfo("Using RetinaFace implementation...")
         img_rows, img_cols, _ = img.shape
 
-        detections = self.detector.process(img).detections
-        if not detections:
+        crops, bboxes, retina_landmarks = extract_face_2(img)
+        
+        if not crops:
             return []
+        
+
+        crops = [(crop*255).astype('uint8') for crop in crops]
+            
+        detections = [self.detector.process(crop) for crop in crops]
+        
+        rospy.loginfo(f"Detected {len(detections)} faces.")
+        
 
         results = []
 
-        for detection in detections:
-
+        for detection, crop, bbox, retina_landmark in zip(detections, crops, bboxes, retina_landmarks):
+            
             face = {}
-
-            face["bb"] = self.get_boundingbox(detection, img_cols, img_rows)
+            
+            
+            y = bbox[1]
+            h = bbox[3] - y
+            x = bbox[0]
+            w = bbox[2] - x
+            img_region = (x, y, w, h)
+            
+            face["bb"] = img_region
 
             landmarks = FacialLandmarks(
                 landmarks = [NormalizedPointOfInterest2D(0, 0, 1) for _ in range(70)],
@@ -503,88 +556,59 @@ class FaceDetector:
                 width = img_width,
             )
 
-            nose_tip = mp_face_detection.get_key_point(
-                detection, mp_face_detection.FaceKeyPoint.NOSE_TIP
-            )
-            face["nose_tip"] = (nose_tip.x, nose_tip.y)
+            face["nose_tip"] = (retina_landmark['nose'][0], retina_landmark['nose'][1])
 
             landmarks.landmarks[FacialLandmarks.NOSE] = NormalizedPointOfInterest2D(
-                int(min(nose_tip.x * img_width, img_width)),
-                int(min(nose_tip.y * img_height, img_height)),
+                int(min(retina_landmark['nose'][0] * img_width, img_width)),
+                int(min(retina_landmark['nose'][1] * img_height, img_height)),
                 1,
             )
 
-            right_eye = mp_face_detection.get_key_point(
-                detection, mp_face_detection.FaceKeyPoint.RIGHT_EYE
-            )
-            face["right_eye"] = (right_eye.x, right_eye.y)
+            face["right_eye"] = (retina_landmark['right_eye'][0], retina_landmark['right_eye'][1])
 
             landmarks.landmarks[
                 FacialLandmarks.RIGHT_PUPIL
             ] = NormalizedPointOfInterest2D(
-                int(min(right_eye.x * img_width, img_width)),
-                int(min(right_eye.y * img_height, img_height)),
+                int(min(retina_landmark['right_eye'][0] * img_width, img_width)),
+                int(min(retina_landmark['right_eye'][1] * img_height, img_height)),
                 1,
             )
 
-            left_eye = mp_face_detection.get_key_point(
-                detection, mp_face_detection.FaceKeyPoint.LEFT_EYE
-            )
-            face["left_eye"] = (left_eye.x, left_eye.y)
+            face["left_eye"] = (retina_landmark['left_eye'][0], retina_landmark['left_eye'][1])
 
             landmarks.landmarks[
                 FacialLandmarks.LEFT_PUPIL
             ] = NormalizedPointOfInterest2D(
-                int(min(left_eye.x * img_width, img_width)),
-                int(min(left_eye.y * img_height, img_height)),
+                int(min(retina_landmark['left_eye'][0] * img_width, img_width)),
+                int(min(retina_landmark['left_eye'][1] * img_height, img_height)),
                 1,
             )
 
-            mouth_center = mp_face_detection.get_key_point(
-                detection, mp_face_detection.FaceKeyPoint.MOUTH_CENTER
-            )
-            face["mouth_center"] = (mouth_center.x, mouth_center.y)
+
+            face["mouth_center"] = ((retina_landmark['mouth_right'][0]+retina_landmark['mouth_left'][0])/2, (retina_landmark['mouth_right'][1]+retina_landmark['mouth_left'][1])/2)
 
             landmarks.landmarks[
                 FacialLandmarks.MOUTH_INNER_TOP_2
             ] = NormalizedPointOfInterest2D(
-                int(min(mouth_center.x * img_width, img_width)),
-                int(min(mouth_center.y * img_height, img_height)),
+                int(min(face["mouth_center"][0] * img_width, img_width)),
+                int(min(face["mouth_center"][1] * img_height, img_height)),
                 1,
             )
-
-            right_ear_tragion = mp_face_detection.get_key_point(
-                detection, mp_face_detection.FaceKeyPoint.RIGHT_EAR_TRAGION
-            )
-            face["right_ear_tragion"] = (right_ear_tragion.x, right_ear_tragion.y)
-
-            landmarks.landmarks[
-                FacialLandmarks.RIGHT_EAR
-            ] = NormalizedPointOfInterest2D(
-                int(min(right_ear_tragion.x * img_width, img_width)),
-                int(min(right_ear_tragion.y * img_height, img_height)),
-                1,
-            )
-
-            left_ear_tragion = mp_face_detection.get_key_point(
-                detection, mp_face_detection.FaceKeyPoint.LEFT_EAR_TRAGION
-            )
-            face["left_ear_tragion"] = (left_ear_tragion.x, left_ear_tragion.y)
-
-            landmarks.landmarks[FacialLandmarks.LEFT_EAR] = NormalizedPointOfInterest2D(
-                int(min(left_ear_tragion.x * img_width, img_width)),
-                int(min(left_ear_tragion.y * img_height, img_height)),
-                1,
-            )
-
+            
             face["facial_landmarks_msg"] = landmarks
+            face["crop"] = img[bbox[1]:bbox[3], bbox[0]:bbox[2]]
+            face["aligned_crop"] = crop
 
             results.append(face)
+            
+            predicted, score = detect_smile(crop)
+            face["smile_score"] = score
 
         return results
 
     def detect_face_mesh(self, img, img_height, img_width):
         """img is expected as RGB"""
+        rospy.loginfo("Using Mediapipe implementation...")
         img_rows, img_cols, _ = img.shape
 
         detections = self.detector.process(img)
@@ -657,7 +681,7 @@ class FaceDetector:
 
 
 class RosFaceDetector:
-    def __init__(self, debug=False, face_mesh=True, max_num_faces=4):
+    def __init__(self, debug=False, face_mesh=False, max_num_faces=4):
 
         self.is_shutting_down = False
         self.debug = debug
@@ -669,7 +693,7 @@ class RosFaceDetector:
         self.faces_pub = rospy.Publisher("/humans/faces/tracked", IdsList, queue_size=1)
 
         self.facedetector = FaceDetector(face_mesh, max_num_faces)
-        self.image_sub = rospy.Subscriber("image", Image, self.callback)
+        self.image_sub = rospy.Subscriber("image", CompressedImage, self.callback, queue_size=1)
         self.image_info_sub = rospy.Subscriber(
             "camera_info", CameraInfo, self.info_callback
         )
@@ -722,8 +746,10 @@ class RosFaceDetector:
         # copy the list of face ID before iterating over detection, so that we
         # can delete non-existant faces at the end.
         knownIds = list(self.knownFaces.keys())
-
-        image = CvBridge().imgmsg_to_cv2(rgb_msg, desired_encoding="bgr8")
+        image = np.fromstring(rgb_msg.data, np.uint8)
+        image = cv2.imdecode(image, cv2.IMREAD_COLOR)
+        #image = CvBridge().imgmsg_to_cv2(rgb_msg, desired_encoding="bgr8")
+        
         img_height, img_width, _ = image.shape
         camera_optical_frame = rgb_msg.header.frame_id
 
@@ -766,9 +792,15 @@ class RosFaceDetector:
                 face.mouth_center = detection["mouth_center"]
                 face.right_eye = detection["right_eye"]
                 face.left_eye = detection["left_eye"]
-                face.right_ear_tragion = detection["right_ear_tragion"]
-                face.left_ear_tragion = detection["left_ear_tragion"]
+                if "right_ear_tragion" in detection:
+                    face.right_ear_tragion = detection["right_ear_tragion"]
+                if "left_ear_tragion" in detection:
+                    face.left_ear_tragion = detection["left_ear_tragion"]
                 face.facial_landmarks_msg = detection["facial_landmarks_msg"]
+                
+                face.crop_face = detection['crop']
+                face.crop_align = detection['aligned_crop']
+                face.smile_score = detection['smile_score']
 
             else:
                 face = Face()
@@ -789,6 +821,10 @@ class RosFaceDetector:
                     face.publish()
                 if not self.is_shutting_down:
                     face.publish_images(image)
+                
+                if not self.is_shutting_down:
+                    rospy.loginfo(f"Publishing Smile Score: {face.smile_score}")
+                    face.smile_pub.publish(face.smile_score)
 
                 if not self.is_shutting_down:
                     if hasattr(self, "K"):
@@ -796,6 +832,8 @@ class RosFaceDetector:
 
                         self.tb.sendTransformMessage(face.head_transform)
                         self.tb.sendTransformMessage(face.gaze_transform)
+                        
+                
 
         self.faces_pub.publish(
             IdsList(
@@ -868,7 +906,7 @@ if __name__ == "__main__":
 
     debug = rospy.get_param("~debug", False)
 
-    face_mesh = rospy.get_param("~face_mesh", True)
+    face_mesh = rospy.get_param("~face_mesh", False)
     max_num_faces = rospy.get_param("~max_num_faces", 4)
 
     detector = RosFaceDetector(debug, face_mesh, max_num_faces)
