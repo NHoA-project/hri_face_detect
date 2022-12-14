@@ -7,12 +7,17 @@ import math
 import cv2
 from keras.preprocessing import image
 import mediapipe as mp
+import rospy
 
 from retinaface import RetinaFace
 from retinaface.commons import postprocess
 from deepface import DeepFace
 
-model = tf.keras.models.load_model("/home/yusepp/full_model_crop.hdf5")
+model = tf.keras.models.load_model("/home/yusepp/cnn_landmarks.h5",  compile=False)
+loss = 'binary_crossentropy'
+opt = tf.keras.optimizers.SGD(learning_rate=0.001, momentum=0.9, nesterov=True, weight_decay=1e-2/10)
+model.compile(optimizer=opt, loss=loss, metrics=['accuracy', tf.keras.metrics.Precision(), tf.keras.metrics.Recall()])
+model2 = tf.keras.models.load_model("/home/yusepp/full_model_crop.hdf5")
 
 
 from functools import wraps
@@ -129,7 +134,8 @@ def alignment_procedure(img, left_eye, right_eye, nose):
 
     return img #return img anyway
 
-@timeit
+
+
 def detect_smile(face: np.ndarray) -> bool:
     """This function detects if the provided image contains a smile.
 
@@ -140,14 +146,34 @@ def detect_smile(face: np.ndarray) -> bool:
         Face Detection status. True for success, False otherwise.
 
     """
-    score = model.predict(np.expand_dims(face, axis=0))[0][0]
+    score = model2.predict(np.expand_dims(face/255, axis=0))[0][0]
     predicted = (score >= 0.5).astype('uint8')
+    rospy.loginfo(f"Smile Score (Not Published): {score:.4f}")
+    return predicted, score
+
+def detect_smile_2(face: np.ndarray, landmarks: np.ndarray) -> bool:
+    """This function detects if the provided image contains a smile.
+
+    Args:
+        face (np.ndarray): numpy array containing the cropped face image.
+
+    Returns:
+        Face Detection status. True for success, False otherwise.
+
+    """
+
+    
+    im = np.expand_dims(face/255, axis=0)
+    lm = np.expand_dims(landmarks, axis=0)
+    score = model.predict([im, lm])[0][0]
+    predicted = (score >= 0.5).astype('uint8')
+    rospy.loginfo(f"Smile Score (Not Published): {score}")
+
     return predicted, score
 
 
 
 
-@timeit
 def extract_face(img, face_detector = None, align = True):
 
     obj = RetinaFace.detect_faces(img_path = img, model = face_detector, threshold = 0.9)
@@ -209,7 +235,6 @@ def extract_face_2(img, face_detector = None, align = True):
     return crops, bboxes, landmarks_list
 
 
-@timeit
 def get_nose_vector(face, results):
     face_2d = []
     face_3d = []
@@ -284,7 +309,6 @@ def get_nose_vector(face, results):
     return text, np.array(p1)-np.array(p2)
 
 
-@timeit
 def get_mesh(image):
     try:
         mp_drawing = mp.solutions.drawing_utils

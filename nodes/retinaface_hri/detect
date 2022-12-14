@@ -17,7 +17,7 @@ from tf.transformations import quaternion_from_euler
 from retinaface_hri.face_pose_estimation import face_pose_estimation
 
 import mediapipe as mp
-from retinaface_hri.face_detection import extract_face, detect_smile, get_nose_vector, get_mesh
+from retinaface_hri.face_detection import extract_face, detect_smile, detect_smile_2, get_nose_vector, get_mesh
 
 mp_face_detection = mp.solutions.face_detection
 mp_face_mesh = mp.solutions.face_mesh
@@ -206,7 +206,7 @@ class Face:
             return
 
         self.roi_pub = rospy.Publisher(
-            "/humans/faces/roi" % self.id,
+            "/humans/faces/roi",
             RegionOfInterest,
             queue_size=1,
         )
@@ -548,7 +548,7 @@ class FaceDetector:
 
         results = []
 
-        for detection, crop, bbox, retina_landmark, orient in zip(detections, crops, bboxes, retina_landmarks, orientations):
+        for detection, crop, bbox, retina_landmark, orient, meshh in zip(detections, crops, bboxes, retina_landmarks, orientations, meshes):
             
             face = {}
             
@@ -609,7 +609,11 @@ class FaceDetector:
             face["crop"] = img[bbox[1]:bbox[3], bbox[0]:bbox[2]]
             face["aligned_crop"] = crop
             
-            predicted, score = detect_smile(crop)
+            if len(meshh) > 0:
+                predicted, score = detect_smile_2(crop, meshh)
+            else:
+                predicted, score = detect_smile(crop)
+                
             face["smile_score"] = score
             face['orientation'] = orient[0]
             face['orientation_vector'] = orient[1]
@@ -814,13 +818,6 @@ class RosFaceDetector:
                 face.looking_head = detection['orientation']
                 face.nose_vector = detection['orientation_vector']
                 
-                
-                rospy.loginfo(f"Publishing Smile Score: {face.smile_score}")
-                rospy.loginfo(f"Publishing Face Direction: {face.looking_head}")
-                rospy.loginfo(f"Publishing Face Direction Vector: {face.nose_vector}")
-                face.smile_pub.publish(face.smile_score)
-                face.face_direction_pub.publish(Int32(data=face.looking_head))
-                face.nose_vector_pub.publish(Int32MultiArray(data=face.nose_vector))
 
             else:
                 face = Face()
@@ -843,6 +840,12 @@ class RosFaceDetector:
                     face.publish()
                 if not self.is_shutting_down:
                     face.publish_images(image)
+                    rospy.loginfo(f"Publishing Smile Score: {face.smile_score}")
+                    rospy.loginfo(f"Publishing Face Direction: {face.looking_head}")
+                    rospy.loginfo(f"Publishing Face Direction Vector: {face.nose_vector}")
+                    face.smile_pub.publish(face.smile_score)
+                    face.face_direction_pub.publish(Int32(data=face.looking_head))
+                    face.nose_vector_pub.publish(Int32MultiArray(data=face.nose_vector))
                     
                     
 
