@@ -4,7 +4,7 @@ import tf
 from hri_msgs.msg import IdsList, FacialLandmarks, NormalizedPointOfInterest2D
 from sensor_msgs.msg import Image, CameraInfo, RegionOfInterest, CompressedImage
 from geometry_msgs.msg import Transform, TransformStamped, Vector3, Quaternion
-from std_msgs.msg import Empty, Header, Float32
+from std_msgs.msg import Empty, Header, Float32, Int32, Int32MultiArray
 import tf_conversions.posemath as pm
 from cv_bridge import CvBridge
 import rospy
@@ -14,10 +14,10 @@ import cv2
 from PIL import Image as PILImage
 import numpy as np
 from tf.transformations import quaternion_from_euler
-from hri_face_detect.face_pose_estimation import face_pose_estimation
+from retinaface_hri.face_pose_estimation import face_pose_estimation
 
 import mediapipe as mp
-from hri_face_detect.face_detection import extract_face_2, detect_smile
+from retinaface_hri.face_detection import extract_face, detect_smile, get_nose_vector, get_mesh
 
 mp_face_detection = mp.solutions.face_detection
 mp_face_mesh = mp.solutions.face_mesh
@@ -157,6 +157,8 @@ class Face:
             self.id = "".join(
                 random.choices("abcdefghijklmnopqrstuvwxyz", k=5)
             )  # for a 5 char long ID
+        
+        self.id = "1"
 
         self.nb_frames_visible = 1
 
@@ -185,6 +187,10 @@ class Face:
         self.crop_face = None
         self.crop_align = None
         self.smile_pub = None
+        self.face_direction_pub = None
+        self.nose_vector_pub = None
+        self.looking_head = None
+        self.nose_vector = None
 
     def initialise_publishers(self):
         """Initialises all the publishers for this face.
@@ -195,35 +201,48 @@ class Face:
         """
 
         # already initialised?
+        
         if self.ready:
             return
 
         self.roi_pub = rospy.Publisher(
-            "/humans/faces/%s/roi" % self.id,
+            "/humans/faces/roi" % self.id,
             RegionOfInterest,
             queue_size=1,
         )
 
         self.cropped_pub = rospy.Publisher(
-            "/humans/faces/%s/cropped/compressed" % self.id,
+            "/humans/faces/cropped/compressed",
             CompressedImage,
             queue_size=1,
         )
 
         self.aligned_pub = rospy.Publisher(
-            "/humans/faces/%s/aligned/compressed" % self.id,
+            "/humans/faces/aligned/compressed",
             CompressedImage,
             queue_size=1,
         )
         
         self.smile_pub = rospy.Publisher(
-            "/humans/faces/%s/smile_score" % self.id,
+            "/humans/faces/smile_score",
             Float32,
+            queue_size=1,
+        )
+        
+        self.face_direction_pub = rospy.Publisher(
+            "/humans/faces/head_direction",
+            Int32,
+            queue_size=1,
+        )
+        
+        self.nose_vector_pub = rospy.Publisher(
+            "/humans/faces/head_direction_vector",
+            Int32MultiArray,
             queue_size=1,
         )
 
         self.landmarks_pub = rospy.Publisher(
-            "/humans/faces/%s/landmarks" % self.id,
+            "/humans/faces/landmarks",
             FacialLandmarks,
             queue_size=1,
         )
@@ -253,7 +272,7 @@ class Face:
         self.publish_cropped_face(src_image)
         self.publish_aligned_face(src_image)
         
-
+        
     def publish_cropped_face(self, src_image):
         msg = CompressedImage()
         msg.header.stamp = rospy.Time.now()
@@ -484,17 +503,7 @@ class FaceDetector:
         
         self.face_mesh = face_mesh
 
-        if not face_mesh:
-            self.detector = mp_face_detection.FaceDetection(
-                model_selection=1, min_detection_confidence=0.5
-            )
-        else:
-            self.detector = mp_face_mesh.FaceMesh(
-                static_image_mode=False,
-                max_num_faces=max_num_faces,
-                refine_landmarks=True,
-                min_detection_confidence=0.5,
-            )
+        self.detector = mp_face_detection.FaceDetection(model_selection=1, min_detection_confidence=0.5)
 
     def make_facial_landmarks_msg(self, detection, img_height, img_width):
 
@@ -522,25 +531,26 @@ class FaceDetector:
         rospy.loginfo("Using RetinaFace implementation...")
         img_rows, img_cols, _ = img.shape
 
-        crops, bboxes, retina_landmarks = extract_face_2(img)
+        crops, bboxes, retina_landmarks = extract_face(img)
+        meshes = [get_mesh(crop) for crop in crops]
         
         if not crops:
             return []
         
 
         crops = [(crop*255).astype('uint8') for crop in crops]
-            
         detections = [self.detector.process(crop) for crop in crops]
         
+        orientations = [get_nose_vector(crops[j],m) for j,m in enumerate(meshes) if len(m) > 0]
+
         rospy.loginfo(f"Detected {len(detections)} faces.")
         
 
         results = []
 
-        for detection, crop, bbox, retina_landmark in zip(detections, crops, bboxes, retina_landmarks):
+        for detection, crop, bbox, retina_landmark, orient in zip(detections, crops, bboxes, retina_landmarks, orientations):
             
             face = {}
-            
             
             y = bbox[1]
             h = bbox[3] - y
@@ -598,11 +608,15 @@ class FaceDetector:
             face["facial_landmarks_msg"] = landmarks
             face["crop"] = img[bbox[1]:bbox[3], bbox[0]:bbox[2]]
             face["aligned_crop"] = crop
-
-            results.append(face)
             
             predicted, score = detect_smile(crop)
             face["smile_score"] = score
+            face['orientation'] = orient[0]
+            face['orientation_vector'] = orient[1]
+
+            results.append(face)
+            
+            
 
         return results
 
@@ -688,7 +702,7 @@ class RosFaceDetector:
         self.face_mesh = face_mesh
 
         semaphore_pub = rospy.Publisher(
-            "/hri_face_detect/ready", Empty, queue_size=1, latch=True
+            "/retinaface_detect/ready", Empty, queue_size=1, latch=True
         )
         self.faces_pub = rospy.Publisher("/humans/faces/tracked", IdsList, queue_size=1)
 
@@ -753,12 +767,8 @@ class RosFaceDetector:
         img_height, img_width, _ = image.shape
         camera_optical_frame = rgb_msg.header.frame_id
 
-        if not self.face_mesh:
-            detections = self.facedetector.detect(image, img_width, img_height)
-        else:
-            detections = self.facedetector.detect_face_mesh(
-                image, img_height, img_width
-            )
+        detections = self.facedetector.detect(image, img_width, img_height)
+
 
         currentIds = []
 
@@ -801,6 +811,16 @@ class RosFaceDetector:
                 face.crop_face = detection['crop']
                 face.crop_align = detection['aligned_crop']
                 face.smile_score = detection['smile_score']
+                face.looking_head = detection['orientation']
+                face.nose_vector = detection['orientation_vector']
+                
+                
+                rospy.loginfo(f"Publishing Smile Score: {face.smile_score}")
+                rospy.loginfo(f"Publishing Face Direction: {face.looking_head}")
+                rospy.loginfo(f"Publishing Face Direction Vector: {face.nose_vector}")
+                face.smile_pub.publish(face.smile_score)
+                face.face_direction_pub.publish(Int32(data=face.looking_head))
+                face.nose_vector_pub.publish(Int32MultiArray(data=face.nose_vector))
 
             else:
                 face = Face()
@@ -808,12 +828,14 @@ class RosFaceDetector:
                 currentIds.append(face.id)
                 self.knownFaces[face.id] = face
 
+        
         # iterate over faces not seen anymore,
         # and unregister corresponding publishers
         for id in knownIds:
             if id not in currentIds:
                 self.knownFaces[id].delete()
                 del self.knownFaces[id]
+        
 
         for _, face in self.knownFaces.items():
             if face.ready:
@@ -821,10 +843,8 @@ class RosFaceDetector:
                     face.publish()
                 if not self.is_shutting_down:
                     face.publish_images(image)
-                
-                if not self.is_shutting_down:
-                    rospy.loginfo(f"Publishing Smile Score: {face.smile_score}")
-                    face.smile_pub.publish(face.smile_score)
+                    
+                    
 
                 if not self.is_shutting_down:
                     if hasattr(self, "K"):
@@ -832,7 +852,7 @@ class RosFaceDetector:
 
                         self.tb.sendTransformMessage(face.head_transform)
                         self.tb.sendTransformMessage(face.gaze_transform)
-                        
+            
                 
 
         self.faces_pub.publish(
@@ -892,7 +912,7 @@ class RosFaceDetector:
 
 
 if __name__ == "__main__":
-    rospy.init_node("hri_face_detect")
+    rospy.init_node("retinaface_detect")
 
     cropped_face_width = rospy.get_param("/humans/faces/width", cropped_face_width)
     cropped_face_height = rospy.get_param("/humans/faces/height", cropped_face_height)

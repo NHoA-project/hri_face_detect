@@ -5,9 +5,30 @@ from PIL import Image
 from typing import List, Tuple
 import math
 import cv2
-from tensorflow.keras.preprocessing import image
+from keras.preprocessing import image
+import mediapipe as mp
+
+from retinaface import RetinaFace
+from retinaface.commons import postprocess
+from deepface import DeepFace
 
 model = tf.keras.models.load_model("/home/yusepp/full_model_crop.hdf5")
+
+
+from functools import wraps
+import time
+
+
+def timeit(func):
+    @wraps(func)
+    def timeit_wrapper(*args, **kwargs):
+        start_time = time.perf_counter()
+        result = func(*args, **kwargs)
+        end_time = time.perf_counter()
+        total_time = end_time - start_time
+        print(f'Function {func.__name__} Took {total_time:.4f} seconds')
+        return result
+    return timeit_wrapper
 
 def fix_size(img, target_size=(224, 224)):
 
@@ -108,6 +129,7 @@ def alignment_procedure(img, left_eye, right_eye, nose):
 
     return img #return img anyway
 
+@timeit
 def detect_smile(face: np.ndarray) -> bool:
     """This function detects if the provided image contains a smile.
 
@@ -125,39 +147,30 @@ def detect_smile(face: np.ndarray) -> bool:
 
 
 
+@timeit
+def extract_face(img, face_detector = None, align = True):
 
-def extract_face(img: np.ndarray) -> Tuple[List[np.ndarray], List[np.ndarray]]:
-    """Detects and return an image crop of the faces.
-
-    Args:
-        img (np.ndarray): numpy array containing the source image.
-
-    Returns:
-        A tuple containing 2 lists: cropped aligned faces and bounding boxes.
-
-    """
-    try:
-        faces  = RetinaFace.detect_faces(img)
-    except:
-        return None, None, None
-    
+    obj = RetinaFace.detect_faces(img_path = img, model = face_detector, threshold = 0.9)
     crops = []
     bboxes = []
-    landmarks = []
-    for face in faces:
-        if faces[face]['score'] >= 0.9:
-            
-            bbox = faces[face]['facial_area']
-            crop = img[bbox[1]:bbox[3], bbox[0]:bbox[2]]
-            crop = alignment_procedure(left_eye=faces[face]['landmarks']['left_eye'], right_eye=faces[face]['landmarks']['right_eye'],
-                                    nose=faces[face]['landmarks']['nose'], img=crop)
-            #crop = cv2.resize(crop, (224, 224), interpolation = cv2.INTER_AREA)
-            #crop = fix_size(crop, (224, 224))
-            bboxes.append(bbox)
-            crops.append(crop)
-            landmarks.append(faces[face]['landmarks'])
+    landmarks_list = []
+    
+    if type(obj) == dict:
+        for key in obj:
+            identity = obj[key]
+            facial_area = identity["facial_area"]
 
-    return crops, bboxes, landmarks
+
+            detected_face = DeepFace.detectFace(img, target_size = (224, 224), detector_backend = 'retinaface')
+            
+            crops.append(detected_face)
+            bboxes.append(facial_area)
+            landmarks_list.append(identity["landmarks"])
+
+
+    return crops, bboxes, landmarks_list
+
+
 
 
 def extract_face_2(img, face_detector = None, align = True):
@@ -165,24 +178,6 @@ def extract_face_2(img, face_detector = None, align = True):
     from retinaface import RetinaFace
     from retinaface.commons import postprocess
 
-    #---------------------------------
-
-    # The BGR2RGB conversion will be done in the preprocessing step of retinaface.
-    # img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB) #retinaface expects RGB but OpenCV read BGR
-
-    """
-    face = None
-    img_region = [0, 0, img.shape[0], img.shape[1]] #Really?
-
-    faces = RetinaFace.extract_faces(img_rgb, model = face_detector, align = align)
-
-    if len(faces) > 0:
-        face = faces[0][:, :, ::-1]
-
-    return face, img_region
-    """
-
-    #--------------------------
 
     obj = RetinaFace.detect_faces(img_path = img, model = face_detector, threshold = 0.9)
     crops = []
@@ -214,5 +209,95 @@ def extract_face_2(img, face_detector = None, align = True):
     return crops, bboxes, landmarks_list
 
 
+@timeit
+def get_nose_vector(face, results):
+    face_2d = []
+    face_3d = []
+    face = cv2.cvtColor(face, cv2.COLOR_RGB2BGR)
+    img_h, img_w, img_c = face.shape
+
+    for idx, lm in enumerate(results):
+        if idx == 33 or idx == 263 or idx == 1 or idx == 61 or idx == 291 or idx == 199:
+            if idx == 1:
+                nose_2d = (lm[0] * img_w, lm[1] * img_h)
+                nose_3d = (lm[0] * img_w, lm[1] * img_h, lm[2] * 8000)
+
+            x, y = int(lm[0] * img_w), int(lm[1] * img_h)
+
+            # Get the 2D Coordinates
+            face_2d.append([x, y])
+
+            # Get the 3D Coordinates
+            face_3d.append([x, y, lm[2]]) 
+        
+        
+    # Convert it to the NumPy array
+    face_2d = np.array(face_2d, dtype=np.float64)
+
+    # Convert it to the NumPy array
+    face_3d = np.array(face_3d, dtype=np.float64) 
+
+
+    # The camera matrix
+    focal_length = 1 * img_w
+
+    cam_matrix = np.array([ [focal_length, 0, img_h / 2],
+                            [0, focal_length, img_w / 2],
+                            [0, 0, 1]])
+
+    # The Distance Matrix
+    dist_matrix = np.zeros((4, 1), dtype=np.float64)
+
+    # Solve PnP
+    success, rot_vec, trans_vec = cv2.solvePnP(face_3d, face_2d, cam_matrix, dist_matrix)
+
+    # Get rotational matrix
+    rmat, jac = cv2.Rodrigues(rot_vec)
+
+    # Get angles
+    angles, mtxR, mtxQ, Qx, Qy, Qz = cv2.RQDecomp3x3(rmat)
+
+    # Get the y rotation degree
+    x = angles[0] * 360
+    y = angles[1] * 360
+    z = angles[2] * 360
     
-    
+    if y < -10:
+        text = "Looking Left"
+        text = 4
+    elif y > 10:
+        text = "Looking Right"
+        text = 3
+    elif x < -10:
+        text = "Looking Down"
+        text = 2
+    else:
+        text = "Forward"
+        text = 1
+
+    # Display the nose direction
+    nose_3d_projection, jacobian = cv2.projectPoints(nose_3d, rot_vec, trans_vec, cam_matrix, dist_matrix)
+
+    p1 = (int(nose_2d[0]), int(nose_2d[1]))
+    p2 = (int(nose_3d_projection[0][0][0]), int(nose_3d_projection[0][0][1]))
+
+    return text, np.array(p1)-np.array(p2)
+
+
+@timeit
+def get_mesh(image):
+    try:
+        mp_drawing = mp.solutions.drawing_utils
+        mp_drawing_styles = mp.solutions.drawing_styles
+        mp_face_mesh = mp.solutions.face_mesh
+        drawing_spec = mp_drawing.DrawingSpec(thickness=1, circle_radius=1)
+        
+        with mp_face_mesh.FaceMesh(static_image_mode=True, max_num_faces=1, refine_landmarks=True, min_detection_confidence=0.5) as face_mesh:
+            results = face_mesh.process((image*255).astype(np.uint8))
+                    
+        for l in results.multi_face_landmarks:
+            results = np.array([[landmark.x, landmark.y, landmark.z] for landmark in l.landmark])
+        
+        return results
+    except:
+        return []

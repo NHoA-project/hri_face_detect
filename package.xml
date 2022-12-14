@@ -1,6 +1,6 @@
 <?xml version="1.0"?>
 <package format="2">
-  <name>hri_face_detect</name>
+  <name>retinaface_hri</name>
   <version>1.4.4</version>
   <description>Google Mediapipe-based face detection for ROS4HRI</description>
 

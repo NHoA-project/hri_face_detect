@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.0.2)
-project(hri_face_detect)
+project(retinaface_hri)
 
 find_package(catkin REQUIRED)
 
@@ -13,7 +13,7 @@ catkin_package(
 
 catkin_python_setup()
 
-catkin_install_python(PROGRAMS nodes/hri_face_detect/detect nodes/hri_face_detect/record
+catkin_install_python(PROGRAMS nodes/retinaface_hri/detect nodes/retinaface_hri/record
                       DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION})
 
 install(DIRECTORY
