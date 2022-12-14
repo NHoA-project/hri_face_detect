@@ -609,10 +609,8 @@ class FaceDetector:
             face["crop"] = img[bbox[1]:bbox[3], bbox[0]:bbox[2]]
             face["aligned_crop"] = crop
             
-            if len(meshh) > 0:
-                predicted, score = detect_smile_2(crop, meshh)
-            else:
-                predicted, score = detect_smile(crop)
+            predicted, score = detect_smile(crop)
+
                 
             face["smile_score"] = score
             face['orientation'] = orient[0]
